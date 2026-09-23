@@ -1,67 +1,126 @@
-name: Build Portable Windows Release
+name: Windows Portable GPU Release Build
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ dev, master ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   pull_request:
-    branches: [ master, main ]
+    branches: [ dev, master ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch:
 
 jobs:
-  build:
+  build-windows-portable:
     runs-on: windows-2022
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
+      VCPKG_BUILD_TYPE: release
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8"
+      BUILD_DIR: b
 
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
 
-    - name: Setup CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.19
-      with:
-        cuda-version: '12.8.0'
-        method: 'network'
+      - name: Install CUDA 12.8
+        run: |
+          cd ..
+          Invoke-WebRequest https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_571.96_windows.exe -OutFile cuda.exe -Verbose
+          Start-Process -FilePath .\cuda.exe -ArgumentList "-y -s -accepteula -toolkit -override -noDisplayDriver" -Wait
 
-    - name: Setup vcpkg Environment
-      run: |
-        echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+      - name: Set CUDA environment
+        run: |
+          echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CUDA_PATH_V12_8=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-    - name: Install Ninja
-      run: choco install ninja -y
+      - name: Normalize vcpkg path
+        run: '"VCPKG_ROOT=$([System.IO.Path]::GetFullPath($env:VCPKG_ROOT))" >> $env:GITHUB_ENV'
 
-    - name: Restore vcpkg Cache
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cache/vcpkg
-          ${{ env.VCPKG_ROOT }}/installed
-        key: vcpkg-windows-${{ hashFiles('vcpkg.json') }}
+      - name: Cache vcpkg tool
+        id: cache-vcpkg-tool
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.VCPKG_ROOT }}
+          key: vcpkg-tool-${{ runner.os }}-2026-02-21
+          restore-keys: vcpkg-tool-${{ runner.os }}-
 
-    - name: Configure CMake
-      shell: cmd
-      run: |
-        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-        cmake -B build -G Ninja ^
-          -DCMAKE_BUILD_TYPE=Release ^
-          -DBUILD_PORTABLE=ON ^
-          -DBUILD_CUDA_MIN_SM=75 ^
-          -DBUILD_CUDA_PTX_ONLY=OFF
+      - name: Setup vcpkg
+        if: steps.cache-vcpkg-tool.outputs.cache-hit != 'true'
+        run: |
+          cd ..
+          git clone https://github.com/microsoft/vcpkg.git
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
-    - name: Build Portable Binary
-      shell: cmd
-      run: |
-        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-        cmake --build build --config Release -j 4
+      - name: Cache vcpkg_installed
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.BUILD_DIR }}/vcpkg_installed
+          key: vcpkg-installed-${{ runner.os }}-prebuilt-ort-v1-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.github/overlays/**') }}
+          restore-keys: vcpkg-installed-${{ runner.os }}-prebuilt-ort-v1-
 
-    - name: Install & Package Distribution
-      shell: cmd
-      run: |
-        cmake --install build --prefix ./dist
-        powershell -Command "Compress-Archive -Path ./dist/* -DestinationPath LichtFeld-Studio-Windows-Portable.zip"
+      - name: Configure CMake for All GPU Architectures
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -B %BUILD_DIR% -S . -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DLFS_FAST_COMPILE=OFF ^
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;90a" ^
+            -DBUILD_PORTABLE=ON ^
+            -DBUILD_PYTHON_STUBS=OFF ^
+            -DLFS_DEV_IMPORT_SOURCE_PYTHON=OFF ^
+            -DLFS_DEV_IMPORT_SOURCE_RESOURCES=OFF
 
-    - name: Upload Build Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: LichtFeld-Studio-Windows-Portable
-        path: LichtFeld-Studio-Windows-Portable.zip
+      - name: Build Portable Binaries
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          set PATH=%CD%\%BUILD_DIR%;%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\bin;%PATH%
+          cmake --build %BUILD_DIR% -j %NUMBER_OF_PROCESSORS%
+
+      - name: Prepare Portable Staging Directory
+        shell: pwsh
+        run: |
+          $staging = "LichtFeld-Studio-Portable"
+          New-Item -ItemType Directory -Force -Path $staging
+
+          # Copy main executable and binaries
+          Copy-Item -Path "$env:BUILD_DIR\*.exe" -Destination $staging -ErrorAction SilentlyContinue
+          Copy-Item -Path "$env:BUILD_DIR\*.dll" -Destination $staging -ErrorAction SilentlyContinue
+
+          # Copy dependency DLLs from vcpkg
+          if (Test-Path "$env:BUILD_DIR\vcpkg_installed\x64-windows\bin") {
+            Copy-Item -Path "$env:BUILD_DIR\vcpkg_installed\x64-windows\bin\*.dll" -Destination $staging -ErrorAction SilentlyContinue
+          }
+
+          # Copy extensions/plugins folder if built
+          if (Test-Path "$env:BUILD_DIR\extensions") {
+            Copy-Item -Path "$env:BUILD_DIR\extensions" -Destination $staging -Recurse -Force
+          }
+
+          # Copy required CUDA runtime libraries for portability
+          $cudaBin = "$env:CUDA_PATH\bin"
+          $cudaDlls = @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll", "cusparse64_*.dll", "curand64_*.dll", "nvjpeg64_*.dll")
+          foreach ($dllPattern in $cudaDlls) {
+            Get-ChildItem -Path $cudaBin -Filter $dllPattern | Copy-Item -Destination $staging -Force
+          }
+
+      - name: Archive Portable Distribution
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "LichtFeld-Studio-Portable\*" -DestinationPath "LichtFeld-Studio-Windows-Portable-x64.zip" -Force
+
+      - name: Upload Portable Zip Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LichtFeld-Studio-Windows-Portable-x64
+          path: LichtFeld-Studio-Windows-Portable-x64.zip
