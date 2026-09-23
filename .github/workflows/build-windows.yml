@@ -1,0 +1,67 @@
+name: Build Portable Windows Release
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Setup CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.19
+      with:
+        cuda-version: '12.8.0'
+        method: 'network'
+
+    - name: Setup vcpkg Environment
+      run: |
+        echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+
+    - name: Install Ninja
+      run: choco install ninja -y
+
+    - name: Restore vcpkg Cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/vcpkg
+          ${{ env.VCPKG_ROOT }}/installed
+        key: vcpkg-windows-${{ hashFiles('vcpkg.json') }}
+
+    - name: Configure CMake
+      shell: cmd
+      run: |
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+        cmake -B build -G Ninja ^
+          -DCMAKE_BUILD_TYPE=Release ^
+          -DBUILD_PORTABLE=ON ^
+          -DBUILD_CUDA_MIN_SM=75 ^
+          -DBUILD_CUDA_PTX_ONLY=OFF
+
+    - name: Build Portable Binary
+      shell: cmd
+      run: |
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+        cmake --build build --config Release -j 4
+
+    - name: Install & Package Distribution
+      shell: cmd
+      run: |
+        cmake --install build --prefix ./dist
+        powershell -Command "Compress-Archive -Path ./dist/* -DestinationPath LichtFeld-Studio-Windows-Portable.zip"
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: LichtFeld-Studio-Windows-Portable
+        path: LichtFeld-Studio-Windows-Portable.zip
