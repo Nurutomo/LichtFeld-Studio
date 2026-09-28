@@ -15,6 +15,7 @@ on:
 
 jobs:
   build-windows-portable:
+    if: github.repository == 'MrNeRF/LichtFeld-Studio' || github.event.pull_request.base.repo.full_name == 'MrNeRF/LichtFeld-Studio'
     runs-on: windows-2022
     env:
       VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
@@ -111,31 +112,44 @@ jobs:
         run: |
           $staging = "LichtFeld-Studio-Portable"
           New-Item -ItemType Directory -Force -Path $staging
-          
-          # Explicitly create the target assets folder
           New-Item -ItemType Directory -Force -Path "$staging\assets"
 
           Copy-Item -Path "$env:BUILD_DIR\*.exe" -Destination $staging -ErrorAction SilentlyContinue
           Copy-Item -Path "$env:BUILD_DIR\*.dll" -Destination $staging -ErrorAction SilentlyContinue
 
-          # Check fallback paths and copy folder contents (\*) directly into staging\assets
+          # Merge all possible asset locations
           $asset_paths = @(
+            "$env:BUILD_DIR\assets\*",
             "$env:BUILD_DIR\src\visualizer\resources\assets\*",
             "src\visualizer\resources\assets\*",
             "src\visualizer\gui\assets\*"
           )
-          
           foreach ($path in $asset_paths) {
             $basePath = $path.TrimEnd('\*')
             if (Test-Path $basePath) {
-              Write-Host "Found assets at $basePath, copying to portable bundle..."
               Copy-Item -Path $path -Destination "$staging\assets" -Recurse -Force
-              break
             }
           }
 
+          # Strictly copy embedded Python Lib and DLLs to resolve Python encoding codec initialization issues
+          $pythonToolDir = "$env:BUILD_DIR\vcpkg_installed\x64-windows\tools\python3"
+          if (Test-Path $pythonToolDir) {
+            if (Test-Path "$pythonToolDir\Lib") {
+              New-Item -ItemType Directory -Force -Path "$staging\Lib"
+              Copy-Item -Path "$pythonToolDir\Lib\*" -Destination "$staging\Lib" -Recurse -Force
+            }
+            if (Test-Path "$pythonToolDir\DLLs") {
+              New-Item -ItemType Directory -Force -Path "$staging\DLLs"
+              Copy-Item -Path "$pythonToolDir\DLLs\*" -Destination "$staging\DLLs" -Recurse -Force
+            }
+            Copy-Item -Path "$pythonToolDir\*.zip" -Destination $staging -ErrorAction SilentlyContinue
+          }
+
+          # Copy vcpkg dynamic dependencies (.dll, embedded python .zip and ._pth configs if they exist)
           if (Test-Path "$env:BUILD_DIR\vcpkg_installed\x64-windows\bin") {
             Copy-Item -Path "$env:BUILD_DIR\vcpkg_installed\x64-windows\bin\*.dll" -Destination $staging -ErrorAction SilentlyContinue
+            Copy-Item -Path "$env:BUILD_DIR\vcpkg_installed\x64-windows\bin\*.zip" -Destination $staging -ErrorAction SilentlyContinue
+            Copy-Item -Path "$env:BUILD_DIR\vcpkg_installed\x64-windows\bin\*._pth" -Destination $staging -ErrorAction SilentlyContinue
           }
 
           if (Test-Path "$env:BUILD_DIR\extensions") {
