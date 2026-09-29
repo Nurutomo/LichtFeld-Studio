@@ -2,6 +2,7 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/environment.hpp"
 #include "core/scene.hpp"
 #include "core/tensor.hpp"
 #include "gui/gallery_scene_publication.hpp"
@@ -302,6 +303,36 @@ TEST(GalleryScenePublicationStackTest, PublicationFitsWorkerStackAndPreservesEmb
         ::testing::ExitedWithCode(EXIT_SUCCESS), "");
 }
 
+// Opening a downloaded project materializes its embedded scene on the hydration worker. A copy buffer on the
+// stack overflows that worker (Windows threads default to 1 MiB) and ends the process without a log line.
+TEST(GalleryScenePublicationStackTest, EmbeddedAssetMaterializesOnWorkerStack) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(
+        ([] {
+            TemporaryDirectory temporary;
+            const auto home = temporary.path / "home";
+            std::filesystem::create_directories(home);
+            ASSERT_TRUE(lfs::core::environment::set_value("LFS_HOME", home.string()));
+            const auto bytes = multi_buffer_asset();
+            auto request = base_request(temporary.path / "download.scene", ExportFormat::GALLERY_SOG);
+            GalleryScenePublishNode node;
+            node.snapshot.row_count = 8;
+            node.snapshot.active_sh_degree = 0;
+            node.snapshot.world_transform = glm::mat4{1.0f};
+            node.name = "encoded";
+            node.encoded = owned_asset("sog", bytes, fixed_uuid(113));
+            request.nodes.push_back(std::move(node));
+            writeGalleryScenePublication(request, {}, {});
+            const auto published = read_published_node(request.path);
+            auto document = require_result_ptr(ProjectDocument::open(request.path / "project.licht"));
+            std::filesystem::path materialized;
+            on_small_stack([&] { materialized = require_result(document->materialize_embedded_asset(published.uuid, "sog")); });
+            EXPECT_EQ(read_file_bytes(materialized), bytes);
+        }(),
+         std::_Exit(::testing::Test::HasFailure() ? EXIT_FAILURE : EXIT_SUCCESS)),
+        ::testing::ExitedWithCode(EXIT_SUCCESS), "");
+}
+
 TEST(GalleryScenePublicationTest, StudioDefaultKeepsCleanSogInsteadOfExpandingToPly) {
     TemporaryDirectory temporary;
     const auto original = unique_encoded_bytes(0x3c);
@@ -506,7 +537,7 @@ TEST(GalleryScenePublicationTest, GallerySpzPublicationCountMatchesVisibleAfterS
     auto snapshot = cpu_snapshot();
     ASSERT_EQ(snapshot.row_count, 8u);
     lfs::core::Tensor del = lfs::core::Tensor::zeros_bool({8}, snapshot.data->means().device());
-    del.slice(0, 2, 5) = lfs::core::Tensor::ones_bool({3}, snapshot.data->means().device());
+    del.slice(0, 2, 5).copy_from(lfs::core::Tensor::ones_bool({3}, snapshot.data->means().device()));
     snapshot.data->soft_delete(del);
     // Snapshot row_count covers stored rows; the deletion mask selects live rows.
     ASSERT_EQ(snapshot.row_count, 8u);
@@ -538,7 +569,7 @@ TEST(GalleryScenePublicationTest, GallerySogPublicationCountMatchesVisibleAfterS
     auto snapshot = cpu_snapshot();
     ASSERT_EQ(snapshot.row_count, 8u);
     lfs::core::Tensor del = lfs::core::Tensor::zeros_bool({8}, snapshot.data->means().device());
-    del.slice(0, 2, 5) = lfs::core::Tensor::ones_bool({3}, snapshot.data->means().device());
+    del.slice(0, 2, 5).copy_from(lfs::core::Tensor::ones_bool({3}, snapshot.data->means().device()));
     snapshot.data->soft_delete(del);
     ASSERT_EQ(snapshot.data->visible_count(), 5u);
 
@@ -727,6 +758,34 @@ TEST(GalleryProjectExportTest, SavedSpzV4IsByteIdentical) {
     writeGalleryScenePublication(publication, {}, {});
     EXPECT_EQ(read_file_bytes(original.path / "0.spz"), read_file_bytes(publication.path / "0.spz"));
     EXPECT_FALSE(publication.materialized_payload);
+}
+
+TEST(GalleryProjectExportTest, PublicationCarriesProjectLicenseAndItsAbsence) {
+    TemporaryDirectory temporary;
+    auto source_request = base_request(temporary.path / "source.scene", ExportFormat::GALLERY_SCENE);
+    source_request.nodes.push_back({.snapshot = cpu_snapshot(), .name = "splat"});
+    writeGalleryScenePublication(source_request, {}, {});
+    const auto source_path = source_request.path / "project.licht";
+
+    auto publish = [&](const std::string& name) {
+        GalleryScenePublishRequest request;
+        std::string commit;
+        prepareGalleryProjectPublication({source_path, temporary.path / name,
+                                          ExportFormat::GALLERY_SCENE, ""},
+                                         request, commit);
+        writeGalleryScenePublication(request, {}, {});
+        return require_result_ptr(ProjectDocument::open(request.path / "project.licht"));
+    };
+
+    auto without = publish("without.scene");
+    EXPECT_FALSE(require_result(without->project().license()).has_value());
+
+    auto source = require_result_ptr(ProjectDocument::open(source_path));
+    const lfs::io::project::ProjectLicense expected{"LicenseRef-Custom", "Use with attribution"};
+    require_status(source->set_license(expected));
+    static_cast<void>(require_result(source->save(source_path)));
+    auto with = publish("with.scene");
+    EXPECT_EQ(require_result(with->project().license()), expected);
 }
 
 TEST(GalleryProjectExportTest, PlyPayloadReencodesToRequestedSog) {

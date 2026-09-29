@@ -331,6 +331,10 @@ namespace lfs::core {
         return oss.str();
     }
 
+    std::size_t Tensor::cuda_direct_storage_live_bytes() {
+        return storage_accounting_state().cuda_direct.live_bytes.load(std::memory_order_relaxed);
+    }
+
     void Tensor::log_storage_memory() {
         log_storage_memory({});
     }
@@ -698,21 +702,11 @@ namespace lfs::core {
         }
     }
 
-    // ============= Copy Assignment - Context-aware (Shallow or Deep) =============
+    // ============= Copy Assignment - Shallow Handle Copy =============
     Tensor& Tensor::operator=(const Tensor& other) {
         if (this == &other) {
             return *this;
         }
-        // PyTorch semantics: slice/view assignment does deep copy, regular assignment does shallow copy
-        // Example: t1[0:5] = t2  -> deep copy into the slice
-        //          t1 = t2        -> shallow copy (both point to same data)
-
-        // If LHS is a view/slice and shapes match, do deep copy
-        if (is_view_ && is_valid() && other.is_valid() &&
-            shape_ == other.shape_ && dtype_ == other.dtype_) {
-            return copy_from(other);
-        }
-
         if (lazy_ir_registered_) {
             internal::lazy_ir_unregister_tensor(id_);
             lazy_ir_registered_ = false;
@@ -785,15 +779,6 @@ namespace lfs::core {
     // ============= Move Assignment =============
     Tensor& Tensor::operator=(Tensor&& other) {
         if (this != &other) {
-            // PyTorch semantics: slice/view assignment does deep copy even for rvalues
-            // This handles: t1.slice(0, 0, 5) = t2.slice(0, 5, 10)
-            // where the RHS is a temporary view
-
-            if (is_view_ && is_valid() && other.is_valid() &&
-                shape_ == other.shape_ && dtype_ == other.dtype_) {
-                return copy_from(other);
-            }
-
             if (lazy_ir_registered_) {
                 internal::lazy_ir_unregister_tensor(id_);
             }
@@ -1071,9 +1056,7 @@ namespace lfs::core {
             return;
         }
 
-        // Produce a dense owned tensor, then rebind *this. Do not assign:
-        // expand views are is_view_=true, so operator= would copy_from into the
-        // view and re-enter data_ptr() (stack overflow).
+        // Materialize storage while preserving this handle's tracing identity.
         Tensor dense = contiguous();
         LFS_ASSERT_MSG(dense.is_valid() && dense.is_contiguous() && !dense.has_zero_stride(),
                        std::format(
@@ -3605,6 +3588,36 @@ namespace lfs::core {
     TensorError::TensorError(const std::string& msg, const Tensor* t)
         : std::runtime_error(msg),
           tensor_info_(t ? t->str() : "") {}
+
+    Tensor Tensor::empty_exact(TensorShape shape, DataType dtype) {
+        LFS_ASSERT_MSG(is_supported_dtype(dtype), "empty_exact received an invalid dtype");
+        const size_t elements = shape.elements();
+        LFS_ASSERT_MSG(elements == 0 || dtype_size(dtype) <= std::numeric_limits<size_t>::max() / elements,
+                       "empty_exact byte count overflow");
+        const size_t bytes = elements * dtype_size(dtype);
+        if (bytes == 0) {
+            return empty(std::move(shape), Device::CUDA, dtype);
+        }
+
+        Tensor t;
+        t.shape_ = shape;
+        t.strides_ = shape.strides();
+        t.storage_offset_ = 0;
+        t.is_contiguous_ = true;
+        t.device_ = Device::CUDA;
+        t.dtype_ = dtype;
+        t.id_ = next_id_++;
+        t.ensure_state();
+        t.state_->stream = getCurrentCUDAStream();
+        const cudaStream_t stream = t.state_->stream;
+        void* ptr = allocate_cuda_storage(
+            bytes, stream, CudaStorageMode::ExactAsync, "tensor.exact", "tensor.empty_exact");
+        t.adopt_storage(ptr, [stream](void* p) { safe_cuda_pool_deallocate(p, stream); });
+        t.data_ = t.data_owner_.get();
+        t.compute_alignment();
+        CudaMemoryPool::instance().record_tensor(t.data_, t.shape().dims(), bytes, dtype_name(t.dtype_));
+        return t;
+    }
 
     Tensor Tensor::zeros_direct(TensorShape shape, size_t capacity, Device device, DataType dtype) {
         LFS_ASSERT_MSG(device == Device::CUDA,

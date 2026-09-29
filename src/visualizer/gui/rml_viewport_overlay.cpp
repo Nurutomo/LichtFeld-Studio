@@ -34,11 +34,15 @@
 
 namespace lfs::vis::gui {
     namespace {
+        // Below this the empty-scene hint no longer fits beside the tool rail.
+        constexpr float kCrampedViewportWidthDp = 360.0f;
+        constexpr float kCrampedViewportHeightDp = 240.0f;
+
         [[nodiscard]] bool isInteractiveViewportOverlayElement(const Rml::Element* const element) {
             if (!element)
                 return false;
             for (auto* node = element; node; node = node->GetParentNode()) {
-                if (node->GetId() == "project-drop-overlay")
+                if (node->GetId() == "project-drop-overlay" || node->GetId() == "empty-state-hint")
                     return false;
             }
             return element->GetTagName() != "body" &&
@@ -356,6 +360,10 @@ namespace lfs::vis::gui {
         vp_pos_ = pos;
         vp_size_ = size;
         screen_origin_ = screen_origin;
+        if (vram_hud_)
+            vram_hud_->setViewportGeometry(
+                viewport_content_offset_, 0.0f,
+                vp_size_.x - viewport_content_offset_, vp_size_.y);
         if (context_size_changed && project_drag_overlay_.visible)
             applyProjectDragOverlay();
     }
@@ -367,6 +375,10 @@ namespace lfs::vis::gui {
             toolbar_roots_dirty_ = true;
             markRenderNeeded(RenderReason::ViewportResize);
         }
+        if (vram_hud_)
+            vram_hud_->setViewportGeometry(
+                viewport_content_offset_, 0.0f,
+                vp_size_.x - viewport_content_offset_, vp_size_.y);
     }
 
     void RmlViewportOverlay::setToolbarPanels(const float primary_x,
@@ -887,6 +899,16 @@ namespace lfs::vis::gui {
         applySplitDividerOverlay();
         applyProjectDragOverlay();
         viewport_content_offset_dirty_ = false;
+    }
+
+    void RmlViewportOverlay::updateViewportContentClasses(const float dp_ratio) {
+        auto* const content = document_ ? document_->GetElementById("viewport-content") : nullptr;
+        if (!content)
+            return;
+        const float width_dp = (vp_size_.x - viewport_content_offset_) / dp_ratio;
+        const float height_dp = vp_size_.y / dp_ratio;
+        content->SetClass("viewport-cramped",
+                          width_dp < kCrampedViewportWidthDp || height_dp < kCrampedViewportHeightDp);
     }
 
     void RmlViewportOverlay::applySplitDividerOverlay() {
@@ -1474,7 +1496,7 @@ namespace lfs::vis::gui {
             tooltip_changed = applyFrameTooltip();
         }
         if (rml_manager_) {
-            rml_manager_->setContextNeedsPassiveMouseMoveFrames(rml_context_, tooltip_.needsFrame());
+            rml_manager_->setContextNeedsPassiveMouseMoveFrames(rml_context_, tooltip_.hasActiveState());
             rml_manager_->setContextTooltipRevealDeadline(rml_context_, tooltip_.revealDeadline());
         }
         const bool can_update_tooltip_only =
@@ -1532,6 +1554,7 @@ namespace lfs::vis::gui {
         const bool size_changed = (w != last_render_w_ || h != last_render_h_);
         const bool toolbar_changed = updateToolbarRoots();
         updateViewportContentOffset();
+        updateViewportContentClasses(toolbar_dpi);
         const bool python_document_dirty = lfs::python::consume_pending_rml_document_updates(document_);
         const bool document_force = theme_changed || size_changed || toolbar_changed;
         bool document_dirty = syncBuiltinDocument(document_force);
@@ -1569,7 +1592,7 @@ namespace lfs::vis::gui {
             tooltip_changed = applyFrameTooltip();
         }
         if (rml_manager_) {
-            rml_manager_->setContextNeedsPassiveMouseMoveFrames(rml_context_, tooltip_.needsFrame());
+            rml_manager_->setContextNeedsPassiveMouseMoveFrames(rml_context_, tooltip_.hasActiveState());
             rml_manager_->setContextTooltipRevealDeadline(rml_context_, tooltip_.revealDeadline());
         }
 
@@ -1609,6 +1632,8 @@ namespace lfs::vis::gui {
                 LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.render.update.context_update", 0.25);
                 rml_context_->Update();
             }
+            if (vram_hud_ && vram_hud_->initializeGeometryAfterLayout())
+                rml_context_->Update();
             updateToolbarRailLayout();
             if (viewport_toolbar_position_ == "free" && applyToolbarPosition()) {
                 LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.render.update.toolbar_position", 0.25);

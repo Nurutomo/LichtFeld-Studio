@@ -50,7 +50,7 @@ namespace {
                                     const Device device) {
         Tensor mask = Tensor::zeros_bool({n}, device);
         if (count > 0) {
-            mask.slice(0, start, start + count) = Tensor::ones_bool({count}, device);
+            mask.slice(0, start, start + count).copy_from(Tensor::ones_bool({count}, device));
         }
         return mask;
     }
@@ -233,8 +233,14 @@ TEST_F(SceneConsolidationExtractTest, SingleVisibleNodeAliasesWithoutAllocatorUs
 }
 
 TEST_F(SceneConsolidationExtractTest, WorkerBuildMatchesSynchronousCombinedModel) {
-    auto first = std::make_shared<SplatData>(bike_.clone());
-    auto second = std::make_shared<SplatData>(bike_.clone());
+    // Scene hands multi-node models above one million visible splats to its
+    // worker, so the synchronous reference must stay below that.
+    const size_t bike_size = static_cast<size_t>(bike_.size());
+    const size_t input_size = std::min(bike_size, size_t{500'000});
+    const auto input = lfs::core::extract_by_mask(
+        bike_, range_mask(bike_size, 0, input_size, bike_.means_raw().device()));
+    auto first = std::make_shared<SplatData>(input.clone());
+    auto second = std::make_shared<SplatData>(input.clone());
     const size_t first_size = static_cast<size_t>(first->size());
 
     std::vector<size_t> allocation_shape_rows;
@@ -304,7 +310,7 @@ TEST_F(SceneConsolidationExtractTest, WorkerBuildMatchesSynchronousCombinedModel
     EXPECT_EQ(worker_build->model->scaling_raw().to_vector(), expected->scaling_raw().to_vector());
     EXPECT_EQ(worker_build->model->rotation_raw().to_vector(), expected->rotation_raw().to_vector());
     EXPECT_EQ(worker_build->model->opacity_raw().to_vector(), expected->opacity_raw().to_vector());
-    EXPECT_EQ(worker_build->model->shN_raw().to_vector(), expected->shN_raw().to_vector());
+    expect_shN_q16(worker_build->model->shN_canonical().to_vector(), expected->shN_canonical().to_vector());
 }
 
 TEST_F(SceneConsolidationExtractTest, SceneDestructionJoinsCombinedModelWorker) {
@@ -505,8 +511,7 @@ TEST_F(SceneConsolidationExtractTest, SoftDeletedRowsAreExcluded) {
     ASSERT_LE(delete_start + delete_count, last_start + built.last_n);
 
     Tensor del = Tensor::zeros_bool({combined_n}, combined->means_raw().device());
-    del.slice(0, delete_start, delete_start + delete_count) =
-        Tensor::ones_bool({delete_count}, combined->means_raw().device());
+    del.slice(0, delete_start, delete_start + delete_count).copy_from(Tensor::ones_bool({delete_count}, combined->means_raw().device()));
     combined->soft_delete(del);
     ASSERT_TRUE(combined->has_deleted_mask());
 
