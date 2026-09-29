@@ -15,6 +15,7 @@ on:
 
 jobs:
   build-windows-portable:
+    if: github.repository == 'Nurutomo/LichtFeld-Studio' || github.event.pull_request.base.repo.full_name == 'Nurutomo/LichtFeld-Studio'
     runs-on: windows-2022
     env:
       VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
@@ -112,16 +113,25 @@ jobs:
           $staging = "LichtFeld-Studio-Portable"
           New-Item -ItemType Directory -Force -Path $staging
           New-Item -ItemType Directory -Force -Path "$staging\assets"
+          New-Item -ItemType Directory -Force -Path "$staging\src"
 
+          # 1. Copy executables, DLLs, and compiled Python extensions (.pyd)
           Copy-Item -Path "$env:BUILD_DIR\*.exe" -Destination $staging -ErrorAction SilentlyContinue
           Copy-Item -Path "$env:BUILD_DIR\*.dll" -Destination $staging -ErrorAction SilentlyContinue
+          Get-ChildItem -Path $env:BUILD_DIR -Filter "*.pyd" -Recurse | Copy-Item -Destination $staging -Force
 
-          # Merge all possible asset locations
+          # 2. Copy the ENTIRE src directory to guarantee no runtime scripts, UIs, or locales are missed
+          if (Test-Path "src") {
+            Copy-Item -Path "src\*" -Destination "$staging\src" -Recurse -Force
+          }
+
+          # 3. Merge known asset paths into the root 'assets' folder as a fallback
           $asset_paths = @(
             "$env:BUILD_DIR\assets\*",
             "$env:BUILD_DIR\src\visualizer\resources\assets\*",
             "src\visualizer\resources\assets\*",
-            "src\visualizer\gui\assets\*"
+            "src\visualizer\gui\assets\*",
+            "src\visualizer\gui\resources\assets\*"
           )
           foreach ($path in $asset_paths) {
             $basePath = $path.TrimEnd('\*')
@@ -130,31 +140,47 @@ jobs:
             }
           }
 
-          # Strictly copy embedded Python Lib and DLLs to resolve Python encoding codec initialization issues
+          # 4. Explicitly copy locales folder to assets/locales
+          $locale_paths = @(
+            "$env:BUILD_DIR\locales",
+            "locales",
+            "src\visualizer\resources\locales",
+            "src\visualizer\gui\locales",
+            "src\visualizer\gui\resources\locales"
+          )
+          foreach ($path in $locale_paths) {
+            if (Test-Path $path) {
+              Copy-Item -Path $path -Destination "$staging\assets\locales" -Recurse -Force
+            }
+          }
+
+          # 5. Bundle embedded Python Standard Library (Lib & DLLs)
           $pythonToolDir = "$env:BUILD_DIR\vcpkg_installed\x64-windows\tools\python3"
           if (Test-Path $pythonToolDir) {
             if (Test-Path "$pythonToolDir\Lib") {
-              New-Item -ItemType Directory -Force -Path "$staging\Lib"
+              New-Item -ItemType Directory -Force -Path "$staging\Lib" -ErrorAction SilentlyContinue
               Copy-Item -Path "$pythonToolDir\Lib\*" -Destination "$staging\Lib" -Recurse -Force
             }
             if (Test-Path "$pythonToolDir\DLLs") {
-              New-Item -ItemType Directory -Force -Path "$staging\DLLs"
+              New-Item -ItemType Directory -Force -Path "$staging\DLLs" -ErrorAction SilentlyContinue
               Copy-Item -Path "$pythonToolDir\DLLs\*" -Destination "$staging\DLLs" -Recurse -Force
             }
             Copy-Item -Path "$pythonToolDir\*.zip" -Destination $staging -ErrorAction SilentlyContinue
           }
 
-          # Copy vcpkg dynamic dependencies (.dll, embedded python .zip and ._pth configs if they exist)
+          # 6. Copy vcpkg dynamic dependencies
           if (Test-Path "$env:BUILD_DIR\vcpkg_installed\x64-windows\bin") {
             Copy-Item -Path "$env:BUILD_DIR\vcpkg_installed\x64-windows\bin\*.dll" -Destination $staging -ErrorAction SilentlyContinue
             Copy-Item -Path "$env:BUILD_DIR\vcpkg_installed\x64-windows\bin\*.zip" -Destination $staging -ErrorAction SilentlyContinue
             Copy-Item -Path "$env:BUILD_DIR\vcpkg_installed\x64-windows\bin\*._pth" -Destination $staging -ErrorAction SilentlyContinue
           }
 
+          # 7. Copy compiled extensions/plugins
           if (Test-Path "$env:BUILD_DIR\extensions") {
             Copy-Item -Path "$env:BUILD_DIR\extensions" -Destination $staging -Recurse -Force
           }
 
+          # 8. Copy CUDA runtime libraries
           $cudaBin = "$env:CUDA_PATH\bin"
           $cudaDlls = @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll", "cusparse64_*.dll", "curand64_*.dll", "nvjpeg64_*.dll")
           foreach ($dllPattern in $cudaDlls) {
